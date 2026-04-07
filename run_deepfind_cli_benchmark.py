@@ -80,6 +80,17 @@ def parse_args() -> argparse.Namespace:
         help="Retries per question if deepfind command fails.",
     )
     parser.add_argument(
+        "--start-id",
+        type=int,
+        default=None,
+        help="Only run selected questions with id >= this value.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing raw/structured output files and skip completed ids.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=10,
@@ -139,6 +150,12 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_existing_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return load_jsonl(path)
 
 
 def run_command(
@@ -494,6 +511,8 @@ def main() -> int:
 
     if args.num_questions <= 0:
         raise ValueError("-n/--num-questions must be > 0")
+    if args.start_id is not None and args.start_id <= 0:
+        raise ValueError("--start-id must be > 0")
     if args.num_agent < 1 or args.num_agent > 4:
         raise ValueError("--num-agent must be between 1 and 4")
     if args.max_iter_per_agent < 1:
@@ -510,7 +529,15 @@ def main() -> int:
         raise ValueError(f"-n {args.num_questions} is larger than total questions ({total})")
 
     selected = query_rows[: args.num_questions]
-    model_name = args.model_name or f"deepfind-cli-json-lr-a{args.num_agent}-n{args.num_questions}"
+    if args.start_id is not None:
+        selected = [row for row in selected if int(row["id"]) >= args.start_id]
+    if not selected:
+        raise ValueError("No questions selected after applying filters")
+
+    default_model_name = f"deepfind-cli-json-lr-a{args.num_agent}-n{args.num_questions}"
+    if args.start_id is not None:
+        default_model_name += f"-from{args.start_id}"
+    model_name = args.model_name or default_model_name
     raw_data_path = DEFAULT_RAW_DATA_DIR / f"{model_name}.jsonl"
     structured_path = DEFAULT_STRUCTURED_DIR / f"{model_name}.structured.jsonl"
 
@@ -522,13 +549,33 @@ def main() -> int:
     print(f"Output raw data: {raw_data_path}", flush=True)
     print(f"Output structured data: {structured_path}", flush=True)
 
-    generated_rows: list[dict[str, Any]] = []
-    structured_rows: list[dict[str, Any]] = []
+    existing_generated_rows = load_existing_jsonl(raw_data_path) if args.resume else []
+    existing_structured_rows = load_existing_jsonl(structured_path) if args.resume else []
+    raw_by_id = {row["id"]: row for row in existing_generated_rows}
+    structured_by_id = {row["id"]: row for row in existing_structured_rows}
+    completed_ids = {
+        int(task["id"])
+        for task in selected
+        if int(task["id"]) in raw_by_id and int(task["id"]) in structured_by_id
+    }
+    if args.resume:
+        print(f"Resume mode: found {len(completed_ids)} completed questions", flush=True)
+
+    generated_rows: list[dict[str, Any]] = [
+        raw_by_id[int(task["id"])] for task in selected if int(task["id"]) in completed_ids
+    ]
+    structured_rows: list[dict[str, Any]] = [
+        structured_by_id[int(task["id"])] for task in selected if int(task["id"]) in completed_ids
+    ]
     for idx, task in enumerate(selected, start=1):
         task_id = task["id"]
         prompt = task["prompt"]
         language = task.get("language")
         print(f"[{idx}/{len(selected)}] id={task_id}", flush=True)
+
+        if int(task_id) in completed_ids:
+            print("    skip: already completed", flush=True)
+            continue
 
         result = ask_deepfind(
             deepfind_dir=deepfind_dir,
@@ -554,6 +601,8 @@ def main() -> int:
                 "payload": result.payload,
             }
         )
+        write_jsonl(raw_data_path, generated_rows)
+        write_jsonl(structured_path, structured_rows)
 
     write_jsonl(raw_data_path, generated_rows)
     write_jsonl(structured_path, structured_rows)
