@@ -5,6 +5,7 @@ import argparse
 import json
 import locale
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -47,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         "--num-questions",
         type=int,
         required=True,
-        help="How many questions to run from data/prompt_data/query.jsonl.",
+        help="Target cumulative question count. Example: -n 10 runs 1-10, then -n 20 resumes and only fills missing items within 1-20.",
     )
     parser.add_argument(
         "--deepfind-dir",
@@ -94,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         "--model-name",
         type=str,
         default=None,
-        help="Output model name. Default: deepfind-cli-json-lr-a{agent}-n{N}.",
+        help="Output model name. Default: deepfind-cli-json-lr-a{agent}-n{N}. Reuse the same name to resume in-place.",
     )
     return parser.parse_args()
 
@@ -136,9 +137,137 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    temp_path.replace(path)
+
+
+def normalize_task_id(value: Any) -> str:
+    return str(value)
+
+
+def index_rows_by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        task_id = row.get("id")
+        if task_id is None:
+            continue
+        rows_by_id[normalize_task_id(task_id)] = row
+    return rows_by_id
+
+
+def load_indexed_jsonl(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    return index_rows_by_id(load_jsonl(path))
+
+
+def merge_missing_rows(
+    destination: dict[str, dict[str, Any]],
+    source: dict[str, dict[str, Any]],
+) -> int:
+    merged = 0
+    for task_id, row in source.items():
+        if task_id in destination:
+            continue
+        destination[task_id] = row
+        merged += 1
+    return merged
+
+
+def sort_rows_for_output(
+    rows_by_id: dict[str, dict[str, Any]],
+    query_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    question_order = {
+        normalize_task_id(row.get("id")): index
+        for index, row in enumerate(query_rows)
+        if isinstance(row, dict) and row.get("id") is not None
+    }
+    default_index = len(question_order)
+
+    def sort_key(row: dict[str, Any]) -> tuple[int, str]:
+        task_id = row.get("id")
+        normalized = normalize_task_id(task_id) if task_id is not None else ""
+        return question_order.get(normalized, default_index), normalized
+
+    return sorted(rows_by_id.values(), key=sort_key)
+
+
+def completed_selected_ids(
+    selected: list[dict[str, Any]],
+    raw_rows_by_id: dict[str, dict[str, Any]],
+    structured_rows_by_id: dict[str, dict[str, Any]],
+) -> set[str]:
+    selected_ids = {
+        normalize_task_id(task.get("id"))
+        for task in selected
+        if isinstance(task, dict) and task.get("id") is not None
+    }
+    return {
+        task_id
+        for task_id in selected_ids
+        if task_id in raw_rows_by_id and task_id in structured_rows_by_id
+    }
+
+
+def discover_prior_checkpoint_names(model_name: str, current_n: int) -> list[str]:
+    match = re.fullmatch(r"(.+)-n(\d+)", model_name)
+    if match is None:
+        return []
+
+    prefix = match.group(1)
+    raw_pattern = re.compile(rf"{re.escape(prefix)}-n(\d+)\.jsonl$")
+    structured_pattern = re.compile(rf"{re.escape(prefix)}-n(\d+)\.structured\.jsonl$")
+    counts: set[int] = set()
+
+    for path in DEFAULT_RAW_DATA_DIR.glob(f"{prefix}-n*.jsonl"):
+        matched = raw_pattern.fullmatch(path.name)
+        if matched is None:
+            continue
+        count = int(matched.group(1))
+        if 0 < count < current_n:
+            counts.add(count)
+
+    for path in DEFAULT_STRUCTURED_DIR.glob(f"{prefix}-n*.structured.jsonl"):
+        matched = structured_pattern.fullmatch(path.name)
+        if matched is None:
+            continue
+        count = int(matched.group(1))
+        if 0 < count < current_n:
+            counts.add(count)
+
+    return [f"{prefix}-n{count}" for count in sorted(counts)]
+
+
+def persist_outputs(
+    *,
+    raw_data_path: Path,
+    structured_path: Path,
+    subset_query_path: Path,
+    completed_query_path: Path,
+    query_rows: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    raw_rows_by_id: dict[str, dict[str, Any]],
+    structured_rows_by_id: dict[str, dict[str, Any]],
+) -> None:
+    write_jsonl(raw_data_path, sort_rows_for_output(raw_rows_by_id, query_rows))
+    write_jsonl(structured_path, sort_rows_for_output(structured_rows_by_id, query_rows))
+    write_jsonl(subset_query_path, selected)
+
+    done_ids = completed_selected_ids(selected, raw_rows_by_id, structured_rows_by_id)
+    completed_selected = [
+        task
+        for task in selected
+        if isinstance(task, dict)
+        and task.get("id") is not None
+        and normalize_task_id(task.get("id")) in done_ids
+    ]
+    write_jsonl(completed_query_path, completed_selected)
 
 
 def run_command(
@@ -513,6 +642,13 @@ def main() -> int:
     model_name = args.model_name or f"deepfind-cli-json-lr-a{args.num_agent}-n{args.num_questions}"
     raw_data_path = DEFAULT_RAW_DATA_DIR / f"{model_name}.jsonl"
     structured_path = DEFAULT_STRUCTURED_DIR / f"{model_name}.structured.jsonl"
+    subset_query_path = REPO_ROOT / "results" / "tmp" / f"{model_name}.query.jsonl"
+    completed_query_path = REPO_ROOT / "results" / "tmp" / f"{model_name}.completed.query.jsonl"
+    selected_positions = {
+        normalize_task_id(task["id"]): index
+        for index, task in enumerate(selected, start=1)
+        if "id" in task
+    }
 
     print(f"Selected {len(selected)} / {total} questions", flush=True)
     print(f"Using deepfind-cli at: {deepfind_dir}", flush=True)
@@ -521,14 +657,66 @@ def main() -> int:
     print(f"Deepfind agents: {args.num_agent}", flush=True)
     print(f"Output raw data: {raw_data_path}", flush=True)
     print(f"Output structured data: {structured_path}", flush=True)
+    print(f"Subset query file: {subset_query_path}", flush=True)
+    print(f"Completed query file: {completed_query_path}", flush=True)
 
-    generated_rows: list[dict[str, Any]] = []
-    structured_rows: list[dict[str, Any]] = []
-    for idx, task in enumerate(selected, start=1):
+    raw_rows_by_id = load_indexed_jsonl(raw_data_path)
+    structured_rows_by_id = load_indexed_jsonl(structured_path)
+
+    imported_checkpoints: list[str] = []
+    imported_raw_count = 0
+    imported_structured_count = 0
+    if args.model_name is None:
+        for checkpoint_name in discover_prior_checkpoint_names(model_name, args.num_questions):
+            checkpoint_raw_path = DEFAULT_RAW_DATA_DIR / f"{checkpoint_name}.jsonl"
+            checkpoint_structured_path = DEFAULT_STRUCTURED_DIR / f"{checkpoint_name}.structured.jsonl"
+            added_raw = merge_missing_rows(raw_rows_by_id, load_indexed_jsonl(checkpoint_raw_path))
+            added_structured = merge_missing_rows(
+                structured_rows_by_id,
+                load_indexed_jsonl(checkpoint_structured_path),
+            )
+            if added_raw or added_structured:
+                imported_checkpoints.append(checkpoint_name)
+                imported_raw_count += added_raw
+                imported_structured_count += added_structured
+
+    if imported_checkpoints:
+        print(
+            "Imported checkpoint data from: " + ", ".join(imported_checkpoints),
+            flush=True,
+        )
+        print(
+            f"Recovered raw rows: {imported_raw_count}; structured rows: {imported_structured_count}",
+            flush=True,
+        )
+
+    persist_outputs(
+        raw_data_path=raw_data_path,
+        structured_path=structured_path,
+        subset_query_path=subset_query_path,
+        completed_query_path=completed_query_path,
+        query_rows=query_rows,
+        selected=selected,
+        raw_rows_by_id=raw_rows_by_id,
+        structured_rows_by_id=structured_rows_by_id,
+    )
+
+    completed_ids = completed_selected_ids(selected, raw_rows_by_id, structured_rows_by_id)
+    pending_tasks = [
+        task
+        for task in selected
+        if normalize_task_id(task["id"]) not in completed_ids
+    ]
+
+    print(f"Already completed: {len(completed_ids)} / {len(selected)}", flush=True)
+    print(f"Remaining to generate: {len(pending_tasks)}", flush=True)
+
+    for task in pending_tasks:
         task_id = task["id"]
         prompt = task["prompt"]
         language = task.get("language")
-        print(f"[{idx}/{len(selected)}] id={task_id}", flush=True)
+        task_pos = selected_positions.get(normalize_task_id(task_id), "?")
+        print(f"[{task_pos}/{len(selected)}] id={task_id}", flush=True)
 
         result = ask_deepfind(
             deepfind_dir=deepfind_dir,
@@ -540,28 +728,34 @@ def main() -> int:
             retries=args.retries,
             env=runtime_env,
         )
-        generated_rows.append(
-            {
-                "id": task_id,
-                "prompt": prompt,
-                "article": result.article,
-            }
+        task_key = normalize_task_id(task_id)
+        raw_rows_by_id[task_key] = {
+            "id": task_id,
+            "prompt": prompt,
+            "article": result.article,
+        }
+        structured_rows_by_id[task_key] = {
+            "id": task_id,
+            "prompt": prompt,
+            "payload": result.payload,
+        }
+        persist_outputs(
+            raw_data_path=raw_data_path,
+            structured_path=structured_path,
+            subset_query_path=subset_query_path,
+            completed_query_path=completed_query_path,
+            query_rows=query_rows,
+            selected=selected,
+            raw_rows_by_id=raw_rows_by_id,
+            structured_rows_by_id=structured_rows_by_id,
         )
-        structured_rows.append(
-            {
-                "id": task_id,
-                "prompt": prompt,
-                "payload": result.payload,
-            }
-        )
+        current_done = len(completed_selected_ids(selected, raw_rows_by_id, structured_rows_by_id))
+        print(f"    checkpoint saved ({current_done}/{len(selected)})", flush=True)
 
-    write_jsonl(raw_data_path, generated_rows)
-    write_jsonl(structured_path, structured_rows)
-    print(f"\nGenerated {len(generated_rows)} answers.", flush=True)
-
-    subset_query_path = REPO_ROOT / "results" / "tmp" / f"{model_name}.query.jsonl"
-    write_jsonl(subset_query_path, selected)
-    print(f"Subset query file: {subset_query_path}", flush=True)
+    print(
+        f"\nAvailable answers: {len(completed_selected_ids(selected, raw_rows_by_id, structured_rows_by_id))} / {len(selected)}",
+        flush=True,
+    )
 
     if args.skip_eval:
         print("Skip evaluation because --skip-eval is set.", flush=True)
