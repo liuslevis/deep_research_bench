@@ -20,15 +20,24 @@ DEFAULT_STRUCTURED_DIR = REPO_ROOT / "results" / "tmp"
 COMMON_ZH_CHARS = set("的一是在不了有人这中大为上个国我以要他时来们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处队南给色光门即保治北造百规热领七海口东导器压志世金增争济阶油思术极交受联什认六共权收证改清己美再采转更单风切打白教速花带安场身车例真务具万每目至达走积示议声报斗完类八离华名确才科张信马节话米整空元况今集温传土许步群广石记需段研界拉林律叫且究观越织装影算低持音众书布复容儿须际商非验连断深难近矿千周委素技备半办青省列习响约支般史感劳便团往酸历市克何除消构府称太准精值号率族维划选标写存候毛亲快效斯院查江型眼王按格养易置派层片始却专状育厂京识适属圆包火住调满县局照参红细引听该铁价严龙飞")
 ZH_PUNCTUATION = "，。！？；：、（）《》“”‘’"
 DEEPFIND_JSON_SNIPPET = (
-    "import json, sys;"
-    "from deepfind.orchestrator import DeepFind;"
-    "num_agent = int(sys.argv[1]);"
-    "max_iter = int(sys.argv[2]);"
-    "query = sys.stdin.buffer.read().decode('utf-8');"
-    "app = DeepFind();"
-    "session = app.session(num_agent=num_agent, max_iter_per_agent=max_iter, long_report_mode=True);"
-    "payload = json.dumps(session.ask_detailed(query), ensure_ascii=False);"
-    "sys.stdout.buffer.write(payload.encode('utf-8'))"
+    "import sys\n"
+    "from deepfind.cli import main\n"
+    "use_gpu = sys.argv[1] == '1'\n"
+    "num_agent = sys.argv[2]\n"
+    "max_iter = sys.argv[3]\n"
+    "query = sys.stdin.buffer.read().decode('utf-8')\n"
+    "argv = [\n"
+    "    query,\n"
+    "    '--json',\n"
+    "    '--long-report-mode',\n"
+    "    '--quiet',\n"
+    "    '--once',\n"
+    "    '--num-agent', num_agent,\n"
+    "    '--max-iter-per-agent', max_iter,\n"
+    "]\n"
+    "if use_gpu:\n"
+    "    argv.append('--gpu')\n"
+    "raise SystemExit(main(argv))\n"
 )
 
 
@@ -87,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         help="Worker count used by benchmark evaluation scripts.",
     )
     parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Run deepfind-cli with --gpu so it uses the local Ollama model instead of the remote Qwen API.",
+    )
+    parser.add_argument(
         "--skip-eval",
         action="store_true",
         help="Only generate raw_data, skip RACE and FACT evaluation.",
@@ -95,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         "--model-name",
         type=str,
         default=None,
-        help="Output model name. Default: deepfind-cli-json-lr-a{agent}-n{N}. Reuse the same name to resume in-place.",
+        help="Output model name. Default: deepfind-cli-json-lr-a{agent}-n{N} or deepfind-cli-json-lr-gpu-a{agent}-n{N}. Reuse the same name to resume in-place.",
     )
     return parser.parse_args()
 
@@ -554,6 +568,7 @@ def ask_deepfind(
     prompt: str,
     *,
     language: str | None,
+    use_gpu: bool,
     num_agent: int,
     max_iter_per_agent: int,
     timeout_sec: int,
@@ -566,6 +581,7 @@ def ask_deepfind(
         "python",
         "-c",
         DEEPFIND_JSON_SNIPPET,
+        "1" if use_gpu else "0",
         str(num_agent),
         str(max_iter_per_agent),
     ]
@@ -639,7 +655,11 @@ def main() -> int:
         raise ValueError(f"-n {args.num_questions} is larger than total questions ({total})")
 
     selected = query_rows[: args.num_questions]
-    model_name = args.model_name or f"deepfind-cli-json-lr-a{args.num_agent}-n{args.num_questions}"
+    model_name = args.model_name or (
+        f"deepfind-cli-json-lr-gpu-a{args.num_agent}-n{args.num_questions}"
+        if args.gpu
+        else f"deepfind-cli-json-lr-a{args.num_agent}-n{args.num_questions}"
+    )
     raw_data_path = DEFAULT_RAW_DATA_DIR / f"{model_name}.jsonl"
     structured_path = DEFAULT_STRUCTURED_DIR / f"{model_name}.structured.jsonl"
     subset_query_path = REPO_ROOT / "results" / "tmp" / f"{model_name}.query.jsonl"
@@ -652,7 +672,10 @@ def main() -> int:
 
     print(f"Selected {len(selected)} / {total} questions", flush=True)
     print(f"Using deepfind-cli at: {deepfind_dir}", flush=True)
-    print("Deepfind mode: --json", flush=True)
+    print(
+        "Deepfind mode: --json --gpu" if args.gpu else "Deepfind mode: --json",
+        flush=True,
+    )
     print("Deepfind long report mode: on", flush=True)
     print(f"Deepfind agents: {args.num_agent}", flush=True)
     print(f"Output raw data: {raw_data_path}", flush=True)
@@ -722,6 +745,7 @@ def main() -> int:
             deepfind_dir=deepfind_dir,
             prompt=prompt,
             language=language,
+            use_gpu=args.gpu,
             num_agent=args.num_agent,
             max_iter_per_agent=args.max_iter_per_agent,
             timeout_sec=args.timeout_sec,
